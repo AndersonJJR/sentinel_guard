@@ -13,11 +13,8 @@ use tokio::sync::{Mutex, RwLock, watch};
 
 use crate::domain::entities::RuntimeConfig;
 use crate::domain::errors::DomainError;
+use crate::domain::path_policy::reject_forbidden_system_dir;
 use crate::domain::ports::ConfigStore;
-
-const FORBIDDEN_SYSTEM_DIRS: &[&str] = &[
-    "/etc", "/bin", "/usr", "/root", "/sbin", "/lib", "/lib64", "/proc", "/sys", "/dev", "/boot",
-];
 
 const MAX_SYMLINK_HOPS: usize = 40;
 
@@ -228,24 +225,6 @@ fn require_absolute_path(path: &Path, label: &str) -> Result<(), DomainError> {
     Ok(())
 }
 
-fn reject_forbidden_system_dir(path: &Path) -> Result<(), DomainError> {
-    if path == Path::new("/") {
-        return Err(DomainError::ForbiddenSystemDirectory(
-            path.display().to_string(),
-        ));
-    }
-
-    for forbidden in FORBIDDEN_SYSTEM_DIRS {
-        if path.starts_with(forbidden) {
-            return Err(DomainError::ForbiddenSystemDirectory(
-                path.display().to_string(),
-            ));
-        }
-    }
-
-    Ok(())
-}
-
 fn normalize_lexical(path: &Path) -> PathBuf {
     let mut stack: Vec<OsString> = Vec::new();
     let mut has_root = false;
@@ -453,6 +432,8 @@ mod tests {
 
     use async_trait::async_trait;
     use tempfile::tempdir;
+
+    use crate::domain::path_policy::FORBIDDEN_SYSTEM_DIRS;
 
     use super::*;
 

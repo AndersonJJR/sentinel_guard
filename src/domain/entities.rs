@@ -1,6 +1,6 @@
 //! Pure domain entities representing inspected artifacts, verdicts, configuration, and alerts.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,21 @@ pub struct FileArtifact {
     pub sha256_hash: String,
     /// Detected MIME type based on binary magic bytes, if recognized.
     pub detected_mime: Option<String>,
+}
+
+impl FileArtifact {
+    /// Normalizes a raw file extension string by trimming whitespace/leading dots and lowercasing.
+    pub fn normalize_extension_str(raw_ext: &str) -> Option<String> {
+        let normalized = raw_ext.trim().trim_start_matches('.').to_ascii_lowercase();
+        (!normalized.is_empty()).then_some(normalized)
+    }
+
+    /// Extracts and normalizes a lowercase extension from `path`, ignoring empty extensions.
+    pub fn normalize_extension(path: &Path) -> Option<String> {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(Self::normalize_extension_str)
+    }
 }
 
 /// Security outcome emitted by a scanner or the overall inspection pipeline.

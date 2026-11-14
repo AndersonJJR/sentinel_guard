@@ -2,4 +2,5 @@
 
 pub mod entities;
 pub mod errors;
+pub mod path_policy;
 pub mod ports;
