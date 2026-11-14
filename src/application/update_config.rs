@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, RwLock, watch};
 
 use crate::domain::entities::RuntimeConfig;
 use crate::domain::errors::DomainError;
-use crate::domain::path_policy::reject_forbidden_system_dir;
+use crate::domain::path_policy::{ensure_distinct_non_nested_dirs, reject_forbidden_system_dir};
 use crate::domain::ports::ConfigStore;
 
 const MAX_SYMLINK_HOPS: usize = 40;
@@ -72,41 +72,37 @@ impl UpdateConfigUseCase {
     pub async fn execute(&self, req: UpdateConfigRequest) -> Result<RuntimeConfig, DomainError> {
         let _update_guard = self.update_lock.lock().await;
 
-        let validated = tokio::task::spawn_blocking(move || -> Result<ValidatedPaths, DomainError> {
-            let quarantine_dir = validate_operational_dir(&req.quarantine_dir, "quarantine_dir")?;
-            let approved_dir = validate_operational_dir(&req.approved_dir, "approved_dir")?;
+        let validated =
+            tokio::task::spawn_blocking(move || -> Result<ValidatedPaths, DomainError> {
+                let quarantine_dir =
+                    validate_operational_dir(&req.quarantine_dir, "quarantine_dir")?;
+                let approved_dir = validate_operational_dir(&req.approved_dir, "approved_dir")?;
 
-            if quarantine_dir == approved_dir
-                || approved_dir.starts_with(&quarantine_dir)
-                || quarantine_dir.starts_with(&approved_dir)
-            {
-                return Err(DomainError::InvalidPath(
-                    "quarantine_dir and approved_dir must be distinct and must not contain each other"
-                        .to_string(),
-                ));
-            }
+                ensure_distinct_non_nested_dirs(&quarantine_dir, &approved_dir)?;
 
-            let clamd_socket_path = req
-                .clamd_socket_path
-                .as_deref()
-                .map(|path| validate_auxiliary_path(path, "clamd_socket_path"))
-                .transpose()?;
+                let clamd_socket_path = req
+                    .clamd_socket_path
+                    .as_deref()
+                    .map(|path| validate_auxiliary_path(path, "clamd_socket_path"))
+                    .transpose()?;
 
-            let suricata_eve_path = req
-                .suricata_eve_path
-                .as_deref()
-                .map(|path| validate_auxiliary_path(path, "suricata_eve_path"))
-                .transpose()?;
+                let suricata_eve_path = req
+                    .suricata_eve_path
+                    .as_deref()
+                    .map(|path| validate_auxiliary_path(path, "suricata_eve_path"))
+                    .transpose()?;
 
-            Ok(ValidatedPaths {
-                quarantine_dir,
-                approved_dir,
-                clamd_socket_path,
-                suricata_eve_path,
+                Ok(ValidatedPaths {
+                    quarantine_dir,
+                    approved_dir,
+                    clamd_socket_path,
+                    suricata_eve_path,
+                })
             })
-        })
-        .await
-        .map_err(|err| DomainError::ConfigError(format!("Path validation task failed: {err}")))??;
+            .await
+            .map_err(|err| {
+                DomainError::ConfigError(format!("Path validation task failed: {err}"))
+            })??;
 
         let (current_clamd, current_suricata) = {
             let guard = self.runtime_config.read().await;

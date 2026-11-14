@@ -28,6 +28,24 @@ pub fn reject_forbidden_system_dir(path: &Path) -> Result<(), DomainError> {
     Ok(())
 }
 
+/// Ensures that `quarantine_dir` and `approved_dir` are distinct and neither contains the other.
+pub fn ensure_distinct_non_nested_dirs(
+    quarantine_dir: &Path,
+    approved_dir: &Path,
+) -> Result<(), DomainError> {
+    if quarantine_dir == approved_dir
+        || approved_dir.starts_with(quarantine_dir)
+        || quarantine_dir.starts_with(approved_dir)
+    {
+        return Err(DomainError::InvalidPath(
+            "quarantine_dir and approved_dir must be distinct and must not contain each other"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Extracts and validates a safe UTF-8 file name from `source_path`, rejecting traversal vectors.
 pub fn sanitize_file_name(source_path: &Path) -> Result<String, DomainError> {
     let raw_bytes = source_path.as_os_str().as_encoded_bytes();
