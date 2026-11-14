@@ -409,11 +409,8 @@ fn row_to_inspection_report(row: &SqliteRow) -> Result<InspectionReport, DomainE
     let verdict_detail: Option<String> = row.try_get("verdict_detail").map_err(map_storage_err)?;
     let inspected_at_raw: String = row.try_get("inspected_at").map_err(map_storage_err)?;
 
-    let extension = Path::new(&file_name)
-        .extension()
-        .or_else(|| Path::new(&source_path_raw).extension())
-        .and_then(|ext| ext.to_str())
-        .map(ToString::to_string);
+    let extension = FileArtifact::normalize_extension(Path::new(&file_name))
+        .or_else(|| FileArtifact::normalize_extension(Path::new(&source_path_raw)));
 
     Ok(InspectionReport {
         id: Some(id),
@@ -457,10 +454,7 @@ mod tests {
             artifact: FileArtifact {
                 path: PathBuf::from(format!("/quarantine/{name}")),
                 sanitized_name: name.to_string(),
-                extension: Path::new(name)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(ToString::to_string),
+                extension: FileArtifact::normalize_extension(Path::new(name)),
                 size_bytes: 1024,
                 sha256_hash: "a".repeat(64),
                 detected_mime: Some("application/octet-stream".to_string()),
@@ -865,5 +859,49 @@ mod tests {
             .await
             .expect_err("non-UTF-8 report path must be rejected");
         assert!(matches!(report_err, DomainError::InvalidPath(_)));
+    }
+
+    #[tokio::test]
+    async fn quarantine_repo_normalizes_extensions_on_round_trip_and_fallback() {
+        let store = SqliteStore::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite migration should succeed");
+
+        let base_time = Utc::now();
+        let uppercase_ext = sample_report("Manual.PDF", SecurityVerdict::Clean, base_time);
+        assert_eq!(uppercase_ext.artifact.extension.as_deref(), Some("pdf"));
+
+        let trailing_dot = sample_report(
+            "trailing.",
+            SecurityVerdict::Clean,
+            base_time + ChronoDuration::seconds(1),
+        );
+        assert_eq!(trailing_dot.artifact.extension, None);
+
+        let mut fallback_source = sample_report(
+            "renamed_without_ext",
+            SecurityVerdict::Clean,
+            base_time + ChronoDuration::seconds(2),
+        );
+        fallback_source.artifact.path = PathBuf::from("/quarantine/Original.JPG");
+
+        store
+            .save_report(&uppercase_ext)
+            .await
+            .expect("save uppercase");
+        store
+            .save_report(&trailing_dot)
+            .await
+            .expect("save trailing dot");
+        store
+            .save_report(&fallback_source)
+            .await
+            .expect("save fallback source");
+
+        let reports = store.list_recent_reports(10).await.expect("list reports");
+        assert_eq!(reports.len(), 3);
+        assert_eq!(reports[0].artifact.extension.as_deref(), Some("jpg"));
+        assert_eq!(reports[1].artifact.extension, None);
+        assert_eq!(reports[2].artifact.extension.as_deref(), Some("pdf"));
     }
 }
