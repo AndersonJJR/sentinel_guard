@@ -1133,7 +1133,40 @@ async fn sqlite_store_hardens_preexisting_permissive_db_and_wal_before_open_and_
             .expect_err("corrupt db must fail migration");
     assert!(matches!(corrupt_err, DomainError::StorageError(_)));
 
-    assert_sqlite_wal_files_mode_0600(&corrupt_db, "pre_open_hardened_before_sqlite_open");
+    let corrupt_db_meta =
+        std::fs::symlink_metadata(&corrupt_db).expect("corrupt_db must exist after pre-open");
+    assert!(
+        !corrupt_db_meta.file_type().is_symlink(),
+        "corrupt_db must not be a symlink"
+    );
+    assert_eq!(
+        corrupt_db_meta.permissions().mode() & 0o777,
+        0o600,
+        "corrupt_db must be hardened to 0o600 prior to SQLite open failure"
+    );
+
+    for sidecar in [&corrupt_wal, &corrupt_shm] {
+        match std::fs::symlink_metadata(sidecar) {
+            Ok(meta) => {
+                assert!(
+                    !meta.file_type().is_symlink(),
+                    "corrupt sidecar {} must not be a symlink",
+                    sidecar.display()
+                );
+                assert_eq!(
+                    meta.permissions().mode() & 0o777,
+                    0o600,
+                    "corrupt sidecar {} must be hardened to 0o600 if still present",
+                    sidecar.display()
+                );
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!(
+                "unexpected metadata error inspecting {}: {err}",
+                sidecar.display()
+            ),
+        }
+    }
 
     // 2. Valid migrated .db whose permissions drifted to 0o644 (with permissive leftover -wal)
     // must be hardened to 0o600 on reopen and stay 0o600 after writes.
@@ -1160,14 +1193,16 @@ async fn sqlite_store_hardens_preexisting_permissive_db_and_wal_before_open_and_
             })
             .await
             .expect("initial write");
+        store.close().await.expect("close initial store");
     }
     std::fs::set_permissions(&valid_db, std::fs::Permissions::from_mode(0o644))
         .expect("simulate permissive 0o644 drift on valid db");
     let valid_wal = PathBuf::from(format!("{}-wal", valid_db.display()));
-    if valid_wal.exists() {
-        std::fs::set_permissions(&valid_wal, std::fs::Permissions::from_mode(0o644))
-            .expect("simulate permissive 0o644 drift on valid wal");
+    if !valid_wal.exists() {
+        std::fs::write(&valid_wal, b"").expect("create deterministic leftover -wal");
     }
+    std::fs::set_permissions(&valid_wal, std::fs::Permissions::from_mode(0o644))
+        .expect("simulate permissive 0o644 drift on valid wal");
 
     let reopened = SqliteStore::connect_and_migrate(&valid_url)
         .await
@@ -1190,6 +1225,7 @@ async fn sqlite_store_hardens_preexisting_permissive_db_and_wal_before_open_and_
         .await
         .expect("write after reopen");
     assert_sqlite_wal_files_mode_0600(&valid_db, "reopened_drifted_valid_db");
+    reopened.close().await.expect("close reopened store");
 
     // 3. Non-regular files (FIFO) on .db or -wal/-shm sidecars must be rejected before open.
     let fifo_db = temp.path().join("named_pipe.db");
