@@ -1,6 +1,9 @@
-.PHONY: build test lint fmt fmt-check audit check
+.PHONY: frontend-build build test lint fmt fmt-check audit check
 
-build:
+frontend-build:
+	cd ../vue_sentinel_guard && npm run type-check && npm run build
+
+build: frontend-build
 	cargo build --release
 
 test:
@@ -21,5 +24,6 @@ audit:
 	else \
 		echo "cargo-audit not installed (install with: cargo install cargo-audit)"; \
 	fi
+	cd ../vue_sentinel_guard && npm audit
 
 check: fmt-check lint test

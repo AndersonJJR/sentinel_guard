@@ -1,6 +1,7 @@
 //! Composition root and daemon entrypoint for Sentinel Guard.
 
 use std::io::ErrorKind;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,6 +22,8 @@ use sentinel_guard::infrastructure::fs_watcher::{
 use sentinel_guard::infrastructure::magic_bytes::{MagicBytesInspector, StreamingHasher};
 use sentinel_guard::infrastructure::sqlite_repo::SqliteStore;
 use sentinel_guard::infrastructure::suricata_tail::SuricataCorrelator;
+use sentinel_guard::presentation::api_routes::{ApiState, build_api_router};
+use sentinel_guard::presentation::sse_broadcaster::{SseBroadcaster, SseEvent};
 
 const WATCHER_EVENT_CHANNEL_CAPACITY: usize = 256;
 
@@ -29,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
     init_tracing()?;
 
     let bootstrap = BootstrapConfig::from_env()?;
+    let bind_addr = parse_bind_address(&bootstrap.bind_address)?;
     let store = Arc::new(SqliteStore::connect_and_migrate(&bootstrap.database_url).await?);
 
     let default_runtime_config = bootstrap.to_default_runtime_config();
@@ -41,14 +45,22 @@ async fn main() -> anyhow::Result<()> {
     let watcher =
         validate_startup_config_and_watcher(&mut initial_config, dir_rx, event_tx).await?;
 
+    let listener = tokio::net::TcpListener::bind(bind_addr)
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to bind HTTP listener to {bind_addr}: {err}"))?;
+    let local_addr = listener.local_addr()?;
+
     let runtime_config = Arc::new(RwLock::new(initial_config));
 
     let hasher = Arc::new(StreamingHasher::new());
     let magic_inspector = Arc::new(MagicBytesInspector::new());
     let clamav_scanner = Arc::new(ClamAvScanner::new(runtime_config.clone()));
     let suricata_correlator = Arc::new(SuricataCorrelator::new(runtime_config.clone()));
-    let scanners: Vec<Arc<dyn FileScanner>> =
-        vec![magic_inspector.clone(), clamav_scanner, suricata_correlator];
+    let scanners: Vec<Arc<dyn FileScanner>> = vec![
+        magic_inspector.clone(),
+        clamav_scanner,
+        suricata_correlator.clone(),
+    ];
     let quarantine_mover = Arc::new(FsQuarantineMover::new());
 
     let inspect_use_case = Arc::new(InspectFileUseCase::new(
@@ -60,17 +72,29 @@ async fn main() -> anyhow::Result<()> {
         runtime_config.clone(),
     ));
 
-    let _update_config_use_case = Arc::new(UpdateConfigUseCase::new(
-        store,
+    let update_config_use_case = Arc::new(UpdateConfigUseCase::new(
+        store.clone(),
         runtime_config.clone(),
         dir_tx,
     ));
+
+    let sse_broadcaster = Arc::new(SseBroadcaster::new());
+    let api_state = Arc::new(ApiState {
+        config_store: store.clone(),
+        quarantine_repo: store,
+        runtime_config: runtime_config.clone(),
+        update_config_use_case,
+        suricata_correlator,
+        sse_broadcaster: sse_broadcaster.clone(),
+        admin_api_token: bootstrap.admin_api_token.clone(),
+    });
+    let app = build_api_router(api_state);
 
     {
         let cfg = runtime_config.read().await;
         tracing::info!(
             app_env = %bootstrap.app_env,
-            bind_address = %bootstrap.bind_address,
+            bind_address = %local_addr,
             quarantine_dir = %cfg.quarantine_dir.display(),
             approved_dir = %cfg.approved_dir.display(),
             clamd_socket_path = %cfg.clamd_socket_path.display(),
@@ -81,10 +105,24 @@ async fn main() -> anyhow::Result<()> {
 
     let mut watcher_handle = tokio::spawn(async move { watcher.run(shutdown_rx).await });
 
+    let mut http_shutdown_rx = shutdown_tx.subscribe();
+    let mut http_handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                while !*http_shutdown_rx.borrow_and_update() {
+                    if http_shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await
+    });
+
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
 
     let mut watcher_result: Option<Result<Result<(), DomainError>, tokio::task::JoinError>> = None;
+    let mut http_result: Option<Result<std::io::Result<()>, tokio::task::JoinError>> = None;
 
     loop {
         tokio::select! {
@@ -94,12 +132,23 @@ async fn main() -> anyhow::Result<()> {
                     Err(err) => tracing::error!(error = %err, "Failed listening for Ctrl+C; initiating shutdown"),
                 }
                 let _ = shutdown_tx.send(true);
+                sse_broadcaster.shutdown();
                 event_rx.close();
                 break;
             }
             join_result = &mut watcher_handle => {
                 watcher_result = Some(join_result);
                 tracing::warn!("Filesystem watcher task exited; stopping daemon event loop");
+                let _ = shutdown_tx.send(true);
+                sse_broadcaster.shutdown();
+                event_rx.close();
+                break;
+            }
+            join_result = &mut http_handle => {
+                http_result = Some(join_result);
+                tracing::warn!("HTTP API server task exited; stopping daemon event loop");
+                let _ = shutdown_tx.send(true);
+                sse_broadcaster.shutdown();
                 event_rx.close();
                 break;
             }
@@ -107,10 +156,11 @@ async fn main() -> anyhow::Result<()> {
                 let Some(path) = maybe_path else {
                     tracing::info!("Watcher event channel closed; stopping daemon event loop");
                     let _ = shutdown_tx.send(true);
+                    sse_broadcaster.shutdown();
                     break;
                 };
 
-                process_watcher_event(&path, &runtime_config, &inspect_use_case).await;
+                process_watcher_event(&path, &runtime_config, &inspect_use_case, &sse_broadcaster).await;
             }
         }
     }
@@ -120,14 +170,16 @@ async fn main() -> anyhow::Result<()> {
         None => watcher_handle.await,
     };
 
-    match final_watcher_result {
-        Ok(Ok(())) => {
-            tracing::info!("Sentinel Guard daemon shut down gracefully");
-            Ok(())
-        }
+    let final_http_result = match http_result {
+        Some(res) => res,
+        None => http_handle.await,
+    };
+
+    let watcher_outcome = match final_watcher_result {
+        Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => {
             tracing::error!(error = %err, "Filesystem watcher terminated with domain error");
-            Err(err.into())
+            Err(anyhow::Error::from(err))
         }
         Err(join_err) => {
             tracing::error!(error = %join_err, "Filesystem watcher task panicked or was cancelled");
@@ -135,7 +187,38 @@ async fn main() -> anyhow::Result<()> {
                 "Filesystem watcher task failed: {join_err}"
             ))
         }
+    };
+
+    let http_outcome = match final_http_result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "HTTP API server terminated with I/O error");
+            Err(anyhow::anyhow!("HTTP API server error: {err}"))
+        }
+        Err(join_err) => {
+            tracing::error!(error = %join_err, "HTTP API server task panicked or was cancelled");
+            Err(anyhow::anyhow!("HTTP API server task failed: {join_err}"))
+        }
+    };
+
+    watcher_outcome?;
+    http_outcome?;
+
+    tracing::info!("Sentinel Guard daemon shut down gracefully");
+    Ok(())
+}
+
+fn parse_bind_address(raw: &str) -> Result<SocketAddr, DomainError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(DomainError::ConfigError(
+            "BIND_ADDRESS must not be empty".to_string(),
+        ));
     }
+
+    trimmed
+        .parse::<SocketAddr>()
+        .map_err(|err| DomainError::ConfigError(format!("Invalid BIND_ADDRESS '{trimmed}': {err}")))
 }
 
 fn init_tracing() -> anyhow::Result<()> {
@@ -156,6 +239,7 @@ async fn process_watcher_event(
     path: &Path,
     runtime_config: &RwLock<RuntimeConfig>,
     inspect_use_case: &InspectFileUseCase,
+    sse_broadcaster: &SseBroadcaster,
 ) {
     let current_quarantine_dir = {
         let guard = runtime_config.read().await;
@@ -181,6 +265,7 @@ async fn process_watcher_event(
                 destination = ?report.destination_path,
                 "Inspection pipeline finished for file"
             );
+            let _ = sse_broadcaster.publish(SseEvent::InspectionCompleted { report });
         }
         Err(err) => {
             tracing::error!(
@@ -552,5 +637,89 @@ mod tests {
                 assert!(matches!(err, DomainError::InvalidPath(_)));
             }
         }
+    }
+
+    #[test]
+    fn parse_bind_address_parses_valid_socket_addrs_and_rejects_invalid_inputs() {
+        assert_eq!(
+            parse_bind_address("127.0.0.1:8080").expect("valid IPv4"),
+            "127.0.0.1:8080".parse::<SocketAddr>().expect("SocketAddr")
+        );
+        assert_eq!(
+            parse_bind_address("  0.0.0.0:9090 \n").expect("trimmed IPv4"),
+            "0.0.0.0:9090".parse::<SocketAddr>().expect("SocketAddr")
+        );
+        assert_eq!(
+            parse_bind_address("[::1]:8443").expect("valid IPv6"),
+            "[::1]:8443".parse::<SocketAddr>().expect("SocketAddr")
+        );
+
+        for invalid in [
+            "",
+            "   ",
+            "127.0.0.1",
+            "localhost:8080",
+            "127.0.0.1:99999",
+            "not-an-address",
+        ] {
+            let err = parse_bind_address(invalid).expect_err("invalid bind address must fail");
+            assert!(
+                matches!(err, DomainError::ConfigError(_)),
+                "expected ConfigError for {invalid:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn process_watcher_event_publishes_inspection_completed_on_success() {
+        let root = tempdir().expect("tempdir");
+        let canonical_root = std::fs::canonicalize(root.path()).expect("canonical root");
+        let q_dir = canonical_root.join("quarantine");
+        let a_dir = canonical_root.join("approved");
+        std::fs::create_dir_all(&q_dir).expect("mkdir q_dir");
+        std::fs::create_dir_all(&a_dir).expect("mkdir a_dir");
+
+        let file_path = q_dir.join("note.txt");
+        std::fs::write(&file_path, b"hello sentinel guard").expect("write test file");
+
+        let store = Arc::new(
+            SqliteStore::connect_and_migrate("sqlite::memory:")
+                .await
+                .expect("in-memory sqlite"),
+        );
+        let runtime_config = Arc::new(RwLock::new(sample_config(q_dir.clone(), a_dir)));
+        let hasher = Arc::new(StreamingHasher::new());
+        let magic_inspector = Arc::new(MagicBytesInspector::new());
+        let scanners: Vec<Arc<dyn FileScanner>> = vec![magic_inspector.clone()];
+        let mover = Arc::new(FsQuarantineMover::new());
+        let inspect_use_case = Arc::new(InspectFileUseCase::new(
+            hasher,
+            magic_inspector,
+            scanners,
+            mover,
+            store,
+            runtime_config.clone(),
+        ));
+
+        let broadcaster = SseBroadcaster::new();
+        let mut rx = broadcaster.subscribe();
+
+        // Event outside active quarantine directory is ignored without publishing SSE.
+        process_watcher_event(
+            &canonical_root.join("outside.txt"),
+            &runtime_config,
+            &inspect_use_case,
+            &broadcaster,
+        )
+        .await;
+        assert!(rx.try_recv().is_err());
+
+        // Event inside active quarantine directory inspects and publishes InspectionCompleted.
+        process_watcher_event(&file_path, &runtime_config, &inspect_use_case, &broadcaster).await;
+        let event = rx.recv().await.expect("receive InspectionCompleted");
+        assert!(matches!(
+            event,
+            SseEvent::InspectionCompleted { report } if report.artifact.sanitized_name == "note.txt"
+        ));
     }
 }
