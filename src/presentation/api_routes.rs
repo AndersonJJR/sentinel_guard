@@ -22,6 +22,7 @@ use crate::domain::errors::DomainError;
 use crate::domain::ports::{ConfigStore, QuarantineRepo};
 use crate::infrastructure::suricata_tail::SuricataCorrelator;
 use crate::presentation::sse_broadcaster::{SseBroadcaster, SseEvent};
+use crate::presentation::static_assets::serve_embedded_asset;
 
 /// Maximum accepted JSON request payload size (64 KB).
 pub const MAX_API_BODY_BYTES: usize = 64 * 1024;
@@ -133,6 +134,7 @@ pub fn build_api_router(state: Arc<ApiState>) -> Router {
     Router::new()
         .nest("/api", api_router)
         .route("/api/", any(api_not_found_handler).layer(auth_layer))
+        .fallback(serve_embedded_asset)
         .layer(DefaultBodyLimit::max(MAX_API_BODY_BYTES))
         .layer(middleware::from_fn(security_headers_middleware))
         .with_state(state)
@@ -1192,5 +1194,90 @@ mod tests {
         while let Some(next_chunk) = stream.next().await {
             let _ = next_chunk.expect("clean stream end");
         }
+    }
+
+    #[tokio::test]
+    async fn embedded_frontend_fallback_serves_spa_without_auth_while_protecting_api_routes() {
+        let harness = build_harness(TEST_TOKEN, Vec::new());
+        let app = build_api_router(harness.state.clone());
+
+        // 1. Unauthenticated requests to SPA routes serve index.html with CSP & security headers.
+        for spa_route in ["/", "/dashboard", "/quarantine", "/config"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri(spa_route)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(res.status(), StatusCode::OK, "expected 200 for {spa_route}");
+            assert_security_headers(res.headers(), false);
+            assert_eq!(
+                res.headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-cache")
+            );
+            assert_eq!(
+                res.headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("text/html; charset=utf-8")
+            );
+            let bytes = to_bytes(res.into_body(), 1024 * 1024)
+                .await
+                .expect("body bytes");
+            let html = std::str::from_utf8(&bytes).expect("utf-8 html");
+            assert!(html.contains("Sentinel Guard"));
+        }
+
+        // 2. Unauthenticated /api, /api/, and /api/v1/unknown STILL return 401 before fallback.
+        for api_route in ["/api", "/api/", "/api/v1/unknown"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri(api_route)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(
+                res.status(),
+                StatusCode::UNAUTHORIZED,
+                "expected 401 for unauthenticated {api_route}"
+            );
+            assert_security_headers(res.headers(), true);
+        }
+
+        // 3. Traversal and missing static assets return 400 / 404 with security headers.
+        let traversal_res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/%2e%2e/etc/passwd")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(traversal_res.status(), StatusCode::BAD_REQUEST);
+        assert_security_headers(traversal_res.headers(), false);
+
+        let missing_asset_res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/assets/nonexistent.js")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(missing_asset_res.status(), StatusCode::NOT_FOUND);
+        assert_security_headers(missing_asset_res.headers(), false);
     }
 }
