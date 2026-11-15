@@ -294,7 +294,7 @@ impl FileScanner for MagicBytesInspector {
 }
 
 /// Opens `path` only if it is a safe, non-system regular non-symlink file and verifies identity to mitigate TOCTOU.
-async fn open_regular_file_safely(path: &Path) -> Result<File, DomainError> {
+pub(crate) async fn open_regular_file_safely(path: &Path) -> Result<File, DomainError> {
     sanitize_file_name(path)?;
     reject_forbidden_system_dir(path)?;
 
