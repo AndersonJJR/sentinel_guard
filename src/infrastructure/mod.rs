@@ -5,3 +5,4 @@ pub mod config_env;
 pub mod fs_watcher;
 pub mod magic_bytes;
 pub mod sqlite_repo;
+pub mod suricata_tail;
