@@ -1,15 +1,15 @@
 //! End-to-end integration tests for Milestone 1 (`feat/m1-project-setup`).
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use secrecy::ExposeSecret;
-use sqlx::Row;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::tempdir;
 use tokio::sync::{RwLock, watch};
+use tokio::task::JoinSet;
+use tokio_rusqlite::{Connection, OpenFlags};
 
 use sentinel_guard::application::update_config::{UpdateConfigRequest, UpdateConfigUseCase};
 use sentinel_guard::domain::entities::{
@@ -201,30 +201,26 @@ async fn sqlite_store_seeds_in_memory_and_preserves_updated_config_across_second
     assert_ne!(loaded_boot2.quarantine_dir, boot2_q);
     assert_ne!(loaded_boot2.approved_dir, boot2_a);
 
-    // Verify directly via SqliteConnectOptions that system_config contains 1 row with updated paths.
-    let inspect_opts = SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false);
-    let raw_pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(inspect_opts)
+    // Verify directly via tokio_rusqlite::Connection (read-only) that system_config contains 1 row with updated paths.
+    let raw_conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .await
-        .expect("connect with SqliteConnectOptions");
+        .expect("connect read-only with tokio_rusqlite");
 
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM system_config")
-        .fetch_one(&raw_pool)
+    let (count, db_q, db_a): (i64, String, String) = raw_conn
+        .call(|conn| {
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM system_config", [], |row| row.get(0))?;
+            let (db_q, db_a): (String, String) = conn.query_row(
+                "SELECT quarantine_dir, approved_dir FROM system_config WHERE id = 1",
+                [],
+                |row| Ok((row.get("quarantine_dir")?, row.get("approved_dir")?)),
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>((count, db_q, db_a))
+        })
         .await
-        .expect("count system_config rows");
+        .expect("query system_config directly");
+
     assert_eq!(count, 1);
-
-    let row = sqlx::query("SELECT quarantine_dir, approved_dir FROM system_config WHERE id = 1")
-        .fetch_one(&raw_pool)
-        .await
-        .expect("fetch id=1 system_config row");
-    let db_q: String = row
-        .try_get("quarantine_dir")
-        .expect("quarantine_dir column");
-    let db_a: String = row.try_get("approved_dir").expect("approved_dir column");
     assert_eq!(PathBuf::from(db_q), persisted_after_update.quarantine_dir);
     assert_eq!(PathBuf::from(db_a), persisted_after_update.approved_dir);
 }
@@ -667,4 +663,563 @@ async fn auxiliary_paths_reject_relative_and_dangling_symlinks_and_sqlite_db_is_
 
     assert!(!rx.has_changed().expect("watch receiver open"));
     assert_eq!(*runtime_state.read().await, seeded);
+}
+
+#[cfg(unix)]
+fn assert_sqlite_wal_files_mode_0600(db_path: &Path, stage: &str) {
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut wal_os = OsString::from(db_path.as_os_str());
+    wal_os.push("-wal");
+    let mut shm_os = OsString::from(db_path.as_os_str());
+    shm_os.push("-shm");
+
+    for path in [db_path, Path::new(&wal_os), Path::new(&shm_os)] {
+        let meta = std::fs::symlink_metadata(path).unwrap_or_else(|err| {
+            panic!(
+                "[{stage}] expected SQLite file {} to exist: {err}",
+                path.display()
+            )
+        });
+        assert!(
+            !meta.file_type().is_symlink(),
+            "[{stage}] SQLite file {} must not be a symlink",
+            path.display()
+        );
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "[{stage}] SQLite file {} must have 0o600 permissions, got {mode:#o}",
+            path.display()
+        );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_store_supports_concurrent_tokio_tasks_and_preserves_0600_wal_permissions() {
+    let temp = tempdir().expect("tempdir");
+    let db_path = temp.path().join("concurrent_wal.db");
+    let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let q1 = temp.path().join("q1");
+    let a1 = temp.path().join("a1");
+    let q2 = temp.path().join("q2");
+    let a2 = temp.path().join("a2");
+    for dir in [&q1, &a1, &q2, &a2] {
+        std::fs::create_dir_all(dir).expect("create test dirs");
+    }
+
+    let q1_str = q1.to_string_lossy().into_owned();
+    let a1_str = a1.to_string_lossy().into_owned();
+    let vars = build_env_map(Some("concurrent_secret"), &db_url, &q1_str, &a1_str);
+    let bootstrap = BootstrapConfig::from_lookup(|k| vars.get(k).map(|v| (*v).to_string()))
+        .expect("bootstrap config");
+
+    {
+        let store = Arc::new(
+            SqliteStore::connect_and_migrate(&bootstrap.database_url)
+                .await
+                .expect("primary store connect and migrate"),
+        );
+        let secondary_store = Arc::new(
+            SqliteStore::connect_and_migrate(&bootstrap.database_url)
+                .await
+                .expect("secondary store connect and migrate"),
+        );
+
+        let seeded = store
+            .load_or_seed(&bootstrap.to_default_runtime_config())
+            .await
+            .expect("seed runtime config");
+        let runtime_lock = Arc::new(RwLock::new(seeded.clone()));
+        let (watcher_tx, _watcher_rx) = watch::channel(seeded.quarantine_dir.clone());
+        let use_case = Arc::new(UpdateConfigUseCase::new(
+            store.clone(),
+            runtime_lock.clone(),
+            watcher_tx,
+        ));
+
+        let writer_count = 20usize;
+        let base_time = Utc::now();
+        let mut tasks = JoinSet::new();
+
+        for idx in 0..writer_count {
+            let repo = if idx % 2 == 0 {
+                store.clone()
+            } else {
+                secondary_store.clone()
+            };
+            tasks.spawn(async move {
+                let report = InspectionReport {
+                    id: None,
+                    artifact: FileArtifact {
+                        path: PathBuf::from(format!("/quarantine/item_{idx}.pdf")),
+                        sanitized_name: format!("item_{idx}.pdf"),
+                        extension: Some("pdf".to_string()),
+                        size_bytes: 1024 + idx as u64,
+                        sha256_hash: format!("{idx:064x}"),
+                        detected_mime: Some("application/pdf".to_string()),
+                    },
+                    verdict: if idx % 4 == 0 {
+                        SecurityVerdict::MaliciousSpoofing {
+                            expected_ext: "pdf".to_string(),
+                            actual_mime: "application/x-executable".to_string(),
+                        }
+                    } else {
+                        SecurityVerdict::Clean
+                    },
+                    destination_path: Some(PathBuf::from(format!("/approved/item_{idx}.pdf"))),
+                    inspected_at: base_time + ChronoDuration::milliseconds(idx as i64),
+                };
+
+                repo.save_report(&report)
+                    .await
+                    .expect("concurrent save_report must not fail with database is locked")
+            });
+        }
+
+        let mut reader_tasks = JoinSet::new();
+        for idx in 0..10usize {
+            let repo = if idx % 2 == 0 {
+                store.clone()
+            } else {
+                secondary_store.clone()
+            };
+            let defaults = bootstrap.to_default_runtime_config();
+            reader_tasks.spawn(async move {
+                let _ = repo
+                    .list_recent_reports(10)
+                    .await
+                    .expect("concurrent list_recent_reports must succeed");
+                let _ = repo
+                    .load_or_seed(&defaults)
+                    .await
+                    .expect("concurrent load_or_seed must succeed");
+            });
+        }
+
+        let update_fut = use_case.execute(UpdateConfigRequest {
+            quarantine_dir: q2.clone(),
+            approved_dir: a2.clone(),
+            clamd_socket_path: None,
+            suricata_eve_path: None,
+        });
+        let joined_report = InspectionReport {
+            id: None,
+            artifact: FileArtifact {
+                path: PathBuf::from("/quarantine/joined.pdf"),
+                sanitized_name: "joined.pdf".to_string(),
+                extension: Some("pdf".to_string()),
+                size_bytes: 2048,
+                sha256_hash: "f".repeat(64),
+                detected_mime: Some("application/pdf".to_string()),
+            },
+            verdict: SecurityVerdict::Clean,
+            destination_path: Some(PathBuf::from("/approved/joined.pdf")),
+            inspected_at: base_time + ChronoDuration::seconds(1),
+        };
+        let extra_write_fut = secondary_store.save_report(&joined_report);
+        let extra_read_fut = store.list_recent_reports(25);
+
+        let (update_res, extra_write_res, extra_read_res) =
+            tokio::join!(update_fut, extra_write_fut, extra_read_fut);
+        update_res.expect("concurrent config update should succeed");
+        let joined_id = extra_write_res.expect("concurrent joined write should succeed");
+        extra_read_res.expect("concurrent joined read should succeed");
+
+        let mut ids = HashSet::with_capacity(writer_count + 1);
+        ids.insert(joined_id);
+        while let Some(res) = tasks.join_next().await {
+            let id = res.expect("writer task must not panic");
+            assert!(id > 0);
+            assert!(ids.insert(id), "duplicate inserted report id {id}");
+        }
+        assert_eq!(ids.len(), writer_count + 1);
+
+        while let Some(res) = reader_tasks.join_next().await {
+            res.expect("reader task must not panic");
+        }
+
+        #[cfg(unix)]
+        assert_sqlite_wal_files_mode_0600(&db_path, "after_concurrent_writes");
+    }
+
+    // Reopen DB, perform additional writes, and verify WAL + count + 0o600 preservation.
+    {
+        let reopened = SqliteStore::connect_and_migrate(&bootstrap.database_url)
+            .await
+            .expect("reopen sqlite store");
+        reopened
+            .save_report(&InspectionReport {
+                id: None,
+                artifact: FileArtifact {
+                    path: PathBuf::from("/quarantine/reopened.pdf"),
+                    sanitized_name: "reopened.pdf".to_string(),
+                    extension: Some("pdf".to_string()),
+                    size_bytes: 512,
+                    sha256_hash: "e".repeat(64),
+                    detected_mime: Some("application/pdf".to_string()),
+                },
+                verdict: SecurityVerdict::Clean,
+                destination_path: Some(PathBuf::from("/approved/reopened.pdf")),
+                inspected_at: Utc::now(),
+            })
+            .await
+            .expect("save_report after reopen");
+
+        #[cfg(unix)]
+        assert_sqlite_wal_files_mode_0600(&db_path, "after_reopen_and_write");
+
+        let raw_conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .await
+            .expect("open read-only connection");
+        let (journal_mode, count): (String, i64) = raw_conn
+            .call(|conn| {
+                let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+                let count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM quarantine_logs", [], |r| r.get(0))?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>((mode, count))
+            })
+            .await
+            .expect("inspect journal_mode and quarantine_logs count");
+        assert_eq!(journal_mode.to_lowercase(), "wal");
+        assert_eq!(count, 22);
+    }
+}
+
+#[tokio::test]
+async fn sqlite_store_rejects_malicious_urls_traversal_system_dirs_and_symlinks() {
+    for traversal_url in [
+        "../sentinel.db",
+        "sqlite://../sentinel.db",
+        "sqlite:///tmp/../etc/sentinel.db",
+        "sqlite://..",
+    ] {
+        let err = SqliteStore::connect_and_migrate(traversal_url)
+            .await
+            .expect_err("path traversal URL must be rejected");
+        assert!(
+            matches!(err, DomainError::PathTraversalAttempt(_)),
+            "expected PathTraversalAttempt for {traversal_url:?}, got {err:?}"
+        );
+    }
+
+    for null_url in ["sqlite:///tmp/sentinel\0.db", "sqlite::memory:\0", "\0"] {
+        let err = SqliteStore::connect_and_migrate(null_url)
+            .await
+            .expect_err("null byte URL must be rejected");
+        assert!(
+            matches!(err, DomainError::InvalidPath(_)),
+            "expected InvalidPath for {null_url:?}, got {err:?}"
+        );
+    }
+
+    for system_url in [
+        "/etc/sentinel.db",
+        "sqlite:///etc/sentinel.db",
+        "sqlite:/etc/sentinel.db",
+        "/root/sentinel.db",
+        "sqlite:///root/sentinel.db",
+        "sqlite:/root/sentinel.db",
+        "sqlite:///bin/sentinel.db",
+        "sqlite:///usr/sentinel.db",
+    ] {
+        let err = SqliteStore::connect_and_migrate(system_url)
+            .await
+            .expect_err("forbidden OS directory URL must be rejected");
+        assert!(
+            matches!(err, DomainError::ForbiddenSystemDirectory(_)),
+            "expected ForbiddenSystemDirectory for {system_url:?}, got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("tempdir");
+        let target_file = temp.path().join("target.bin");
+        std::fs::write(&target_file, b"target").expect("create target file");
+
+        // Symlinked .db file (existing target & dangling).
+        let db_link = temp.path().join("db_link.db");
+        symlink(&target_file, &db_link).expect("create db symlink");
+        let db_link_err =
+            SqliteStore::connect_and_migrate(&format!("sqlite://{}", db_link.display()))
+                .await
+                .expect_err("symlink .db must be rejected");
+        assert!(matches!(db_link_err, DomainError::PathTraversalAttempt(_)));
+
+        // Symlinked -wal and -shm sidecars (existing target & dangling).
+        for suffix in ["-wal", "-shm"] {
+            let db_for_existing = temp
+                .path()
+                .join(format!("sidecar_existing_{}.db", &suffix[1..]));
+            let sidecar_existing =
+                PathBuf::from(format!("{}{}", db_for_existing.display(), suffix));
+            symlink(&target_file, &sidecar_existing).expect("create existing sidecar symlink");
+            let err_existing = SqliteStore::connect_and_migrate(&format!(
+                "sqlite://{}",
+                db_for_existing.display()
+            ))
+            .await
+            .expect_err("symlinked sidecar must be rejected");
+            assert!(
+                matches!(err_existing, DomainError::PathTraversalAttempt(_)),
+                "expected PathTraversalAttempt for {suffix} existing symlink, got {err_existing:?}"
+            );
+
+            let db_for_dangling = temp
+                .path()
+                .join(format!("sidecar_dangling_{}.db", &suffix[1..]));
+            let sidecar_dangling =
+                PathBuf::from(format!("{}{}", db_for_dangling.display(), suffix));
+            symlink("/etc/nonexistent_wal_target", &sidecar_dangling)
+                .expect("create dangling sidecar symlink");
+            let err_dangling = SqliteStore::connect_and_migrate(&format!(
+                "sqlite://{}",
+                db_for_dangling.display()
+            ))
+            .await
+            .expect_err("dangling symlinked sidecar must be rejected");
+            assert!(
+                matches!(err_dangling, DomainError::PathTraversalAttempt(_)),
+                "expected PathTraversalAttempt for {suffix} dangling symlink, got {err_dangling:?}"
+            );
+        }
+
+        // Ancestor symlink pointing directly to /etc and via /.
+        let etc_alias = temp.path().join("etc_alias");
+        symlink("/etc", &etc_alias).expect("create etc ancestor symlink");
+        let etc_alias_err = SqliteStore::connect_and_migrate(&format!(
+            "sqlite://{}/sentinel.db",
+            etc_alias.display()
+        ))
+        .await
+        .expect_err("ancestor symlink to /etc must be rejected");
+        assert!(matches!(
+            etc_alias_err,
+            DomainError::ForbiddenSystemDirectory(_)
+        ));
+
+        let root_alias = temp.path().join("root_alias");
+        symlink("/", &root_alias).expect("create root ancestor symlink");
+        let root_etc_err = SqliteStore::connect_and_migrate(&format!(
+            "sqlite://{}/etc/sentinel.db",
+            root_alias.display()
+        ))
+        .await
+        .expect_err("ancestor symlink via / to /etc must be rejected");
+        assert!(matches!(
+            root_etc_err,
+            DomainError::ForbiddenSystemDirectory(_)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn sqlite_store_enforces_hardened_memory_mode_and_path_hygiene() {
+    for valid_mem in [
+        ":memory:",
+        "sqlite::memory:",
+        "sqlite://:memory:",
+        "sqlite:///ignored.db?mode=memory",
+    ] {
+        let store = SqliteStore::connect_and_migrate(valid_mem)
+            .await
+            .expect("valid in-memory URL should connect");
+        assert!(
+            store
+                .list_recent_reports(5)
+                .await
+                .expect("query empty reports")
+                .is_empty()
+        );
+    }
+
+    for forbidden_mem in [
+        "sqlite:///etc/sentinel.db?mode=memory",
+        "sqlite:///root/sentinel.db?mode=memory",
+        "sqlite:///usr/sentinel.db?mode=memory",
+        "sqlite:///?mode=memory",
+    ] {
+        let err = SqliteStore::connect_and_migrate(forbidden_mem)
+            .await
+            .expect_err("forbidden OS dir with ?mode=memory must be rejected");
+        assert!(
+            matches!(err, DomainError::ForbiddenSystemDirectory(_)),
+            "expected ForbiddenSystemDirectory for {forbidden_mem:?}, got {err:?}"
+        );
+    }
+
+    for traversal_mem in [
+        "sqlite:///tmp/../etc/sentinel.db?mode=memory",
+        "sqlite://../ignored.db?mode=memory",
+        "sqlite:///tmp\\..\\etc\\sentinel.db",
+    ] {
+        let err = SqliteStore::connect_and_migrate(traversal_mem)
+            .await
+            .expect_err("traversal URL must be rejected even with ?mode=memory");
+        assert!(
+            matches!(err, DomainError::PathTraversalAttempt(_)),
+            "expected PathTraversalAttempt for {traversal_mem:?}, got {err:?}"
+        );
+    }
+
+    for invalid_hygiene in [
+        "sqlite:///tmp/./sentinel.db",
+        "sqlite:///tmp/./ignored.db?mode=memory",
+        "sqlite://./sentinel.db",
+        "sqlite:///tmp\\.\\sentinel.db",
+        "sqlite:///tmp/.hidden.db",
+        "sqlite:///tmp/bad\nname.db",
+        "sqlite:///tmp/ignored.db?mode=memory\t",
+    ] {
+        let err = SqliteStore::connect_and_migrate(invalid_hygiene)
+            .await
+            .expect_err("relative '.', backslash, hidden name, and control chars must be rejected");
+        assert!(
+            matches!(err, DomainError::InvalidPath(_)),
+            "expected InvalidPath for {invalid_hygiene:?}, got {err:?}"
+        );
+    }
+
+    for bad_mode in [
+        "?mode=memory",
+        "sqlite://?mode=memory",
+        "sqlite:///tmp/test.db?mode=rwc&mode=memory",
+        "sqlite:///tmp/test.db?mode=memory&mode=rwc",
+        "sqlite:///tmp/test.db?mode=ro",
+        "sqlite:///tmp/test.db?mode=",
+        "sqlite:///tmp/test.db?mode",
+        "sqlite://:memory:?mode=rwc",
+    ] {
+        let err = SqliteStore::connect_and_migrate(bad_mode)
+            .await
+            .expect_err("contradictory or unsupported mode query must be rejected");
+        assert!(
+            matches!(err, DomainError::StorageError(_)),
+            "expected StorageError for {bad_mode:?}, got {err:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sqlite_store_hardens_preexisting_permissive_db_and_wal_before_open_and_rejects_fifos() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let temp = tempdir().expect("tempdir");
+
+    // 1. Pre-existing permissive (0o644) .db and -wal/-shm files must be hardened to 0o600
+    // before SQLite opens them (verified even when SQLite fails on corrupt content).
+    let corrupt_db = temp.path().join("corrupt_preexisting.db");
+    let corrupt_wal = PathBuf::from(format!("{}-wal", corrupt_db.display()));
+    let corrupt_shm = PathBuf::from(format!("{}-shm", corrupt_db.display()));
+    std::fs::write(&corrupt_db, b"NOT SQLITE").expect("write corrupt db");
+    std::fs::write(&corrupt_wal, b"corrupt wal").expect("write corrupt wal");
+    std::fs::write(&corrupt_shm, b"corrupt shm").expect("write corrupt shm");
+    for path in [&corrupt_db, &corrupt_wal, &corrupt_shm] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+            .expect("set permissive 0o644 mode");
+    }
+
+    let corrupt_err =
+        SqliteStore::connect_and_migrate(&format!("sqlite://{}", corrupt_db.display()))
+            .await
+            .expect_err("corrupt db must fail migration");
+    assert!(matches!(corrupt_err, DomainError::StorageError(_)));
+
+    assert_sqlite_wal_files_mode_0600(&corrupt_db, "pre_open_hardened_before_sqlite_open");
+
+    // 2. Valid migrated .db whose permissions drifted to 0o644 (with permissive leftover -wal)
+    // must be hardened to 0o600 on reopen and stay 0o600 after writes.
+    let valid_db = temp.path().join("drifted_valid.db");
+    let valid_url = format!("sqlite://{}?mode=rwc", valid_db.display());
+    {
+        let store = SqliteStore::connect_and_migrate(&valid_url)
+            .await
+            .expect("initial valid connect");
+        store
+            .save_report(&InspectionReport {
+                id: None,
+                artifact: FileArtifact {
+                    path: PathBuf::from("/quarantine/initial.pdf"),
+                    sanitized_name: "initial.pdf".to_string(),
+                    extension: Some("pdf".to_string()),
+                    size_bytes: 128,
+                    sha256_hash: "a".repeat(64),
+                    detected_mime: Some("application/pdf".to_string()),
+                },
+                verdict: SecurityVerdict::Clean,
+                destination_path: Some(PathBuf::from("/approved/initial.pdf")),
+                inspected_at: Utc::now(),
+            })
+            .await
+            .expect("initial write");
+    }
+    std::fs::set_permissions(&valid_db, std::fs::Permissions::from_mode(0o644))
+        .expect("simulate permissive 0o644 drift on valid db");
+    let valid_wal = PathBuf::from(format!("{}-wal", valid_db.display()));
+    if valid_wal.exists() {
+        std::fs::set_permissions(&valid_wal, std::fs::Permissions::from_mode(0o644))
+            .expect("simulate permissive 0o644 drift on valid wal");
+    }
+
+    let reopened = SqliteStore::connect_and_migrate(&valid_url)
+        .await
+        .expect("reopen drifted valid db");
+    reopened
+        .save_report(&InspectionReport {
+            id: None,
+            artifact: FileArtifact {
+                path: PathBuf::from("/quarantine/after_reopen.pdf"),
+                sanitized_name: "after_reopen.pdf".to_string(),
+                extension: Some("pdf".to_string()),
+                size_bytes: 256,
+                sha256_hash: "b".repeat(64),
+                detected_mime: Some("application/pdf".to_string()),
+            },
+            verdict: SecurityVerdict::Clean,
+            destination_path: Some(PathBuf::from("/approved/after_reopen.pdf")),
+            inspected_at: Utc::now(),
+        })
+        .await
+        .expect("write after reopen");
+    assert_sqlite_wal_files_mode_0600(&valid_db, "reopened_drifted_valid_db");
+
+    // 3. Non-regular files (FIFO) on .db or -wal/-shm sidecars must be rejected before open.
+    let fifo_db = temp.path().join("named_pipe.db");
+    let status = Command::new("mkfifo")
+        .arg(&fifo_db)
+        .status()
+        .expect("create fifo db");
+    assert!(status.success(), "mkfifo must succeed");
+    let fifo_db_err = SqliteStore::connect_and_migrate(&format!("sqlite://{}", fifo_db.display()))
+        .await
+        .expect_err("FIFO database path must be rejected");
+    assert!(matches!(fifo_db_err, DomainError::StorageError(_)));
+
+    for suffix in ["-wal", "-shm"] {
+        let host_db = temp
+            .path()
+            .join(format!("fifo_sidecar_{}.db", &suffix[1..]));
+        let fifo_sidecar = PathBuf::from(format!("{}{}", host_db.display(), suffix));
+        let sidecar_status = Command::new("mkfifo")
+            .arg(&fifo_sidecar)
+            .status()
+            .expect("create fifo sidecar");
+        assert!(sidecar_status.success(), "mkfifo sidecar must succeed");
+        let sidecar_err =
+            SqliteStore::connect_and_migrate(&format!("sqlite://{}", host_db.display()))
+                .await
+                .expect_err("FIFO sidecar must be rejected");
+        assert!(
+            matches!(sidecar_err, DomainError::StorageError(_)),
+            "expected StorageError for FIFO {suffix}, got {sidecar_err:?}"
+        );
+    }
 }
