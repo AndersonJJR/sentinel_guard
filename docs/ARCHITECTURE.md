@@ -2,7 +2,7 @@
 
 **Versão:** 1.0.0  
 **Status:** Aprovado para Desenvolvimento (Marco 1 → Marco 3)  
-**Stack Principal:** Rust (Tokio, Axum, SQLx, Notify), Vue 3 (SPA Estática via `rust-embed`), SQLite, Suricata IDS, ClamAV.
+**Stack Principal:** Rust (Tokio, Axum, tokio-rusqlite / rusqlite, Notify), Vue 3 (SPA Estática via `rust-embed`), SQLite (`bundled` >= 3.54), Suricata IDS, ClamAV.
 
 ## 1. Visão Geral e Escopo do Sistema
 
@@ -31,7 +31,7 @@ Sentinel Guard/
 │   ├── docs/
 │   │   ├── ARCHITECTURE.md       # Este documento (Contexto mestre para Agentes)
 │   │   └── AGENTS_WORKFLOW.md    # Contratos dos agentes orquestrados
-│   ├── migrations/               # Scripts SQL versionados (SQLx)
+│   ├── migrations/               # Scripts SQL versionados (aplicados via execute_batch no startup)
 │   ├── tests/                    # Testes de integração
 │   └── src/
 │       ├── main.rs               # Composition Root (Injeção de dependências e bootstrap)
@@ -66,7 +66,7 @@ Sentinel Guard/
 2. **Open/Closed (OCP):** `InspectFileUseCase` recebe `Vec<Arc<dyn FileScanner>>`. Adicionar o ClamAV no Marco 2 significa implementar `FileScanner` e registrá-lo em `main.rs`, sem alterar a lógica de orquestração existente.
 3. **Liskov Substitution (LSP):** Qualquer implementação de `ConfigStore` (em memória para testes ou SQLite em produção) comporta-se de maneira idêntica sob o contrato da trait.
 4. **Interface Segregation (ISP):** Traits pequenas e focadas (`HashCalculator`, `MimeValidator`, `FileScanner`, `QuarantineMover`, `ConfigStore`, `QuarantineRepo`).
-5. **Dependency Inversion (DIP):** As camadas `domain` e `application` nunca importam crates de infraestrutura (`sqlx`, `notify`, `tokio::fs`, `infer`, `dotenvy`, `axum`). Elas dependem apenas de abstrações definidas em `domain/ports.rs`.
+5. **Dependency Inversion (DIP):** As camadas `domain` e `application` nunca importam crates de infraestrutura (`tokio-rusqlite`, `rusqlite`, `notify`, `tokio::fs`, `infer`, `dotenvy`, `axum`). Elas dependem apenas de abstrações definidas em `domain/ports.rs`.
 
 ## 3. Gerenciamento de Configuração, Segredos e Segurança
 
@@ -86,7 +86,8 @@ Sentinel Guard/
 2. **Prevenção de Path Traversal na Movimentação:** Extrair estritamente o `file_name()` sanitizado, rejeitando componentes `..`, `/`, `\` ou bytes nulos.
 3. **Permissões Restritas (Least Privilege):** Forçar `chmod -x` em arquivos na quarentena (`0o640` em processamento, `0o600` quando isolado como malicioso, `0o640` no destino aprovado).
 4. **Proibição de `.unwrap()` / `.expect()`:** Todo código de produção deve propagar erros via `?` com `DomainError`.
-5. **Auditoria de Dependências:** `cargo audit` (Rust) e `npm audit` (Frontend) antes de cada merge em `main`.
+5. **Auditoria de Dependências e Persistência Segura (SQLite):** `cargo audit` (Rust) e `npm audit` (Frontend) antes de cada merge em `main`.
+   - **Decisão Técnica de Segurança (`sec/migrate-tokio-rusqlite`):** A camada de persistência utiliza `tokio-rusqlite` / `rusqlite` com SQLite `bundled` (>= 3.54 / `libsqlite3-sys >= 0.40`) em substituição ao `sqlx`, eliminando as vulnerabilidades `RUSTSEC-2026-0459` (`libsqlite3-sys 0.30.1`) e `RUSTSEC-2023-0071` (`rsa 0.9.10`, transitiva do driver MySQL do `sqlx`). A abertura do banco aplica validação estrita de `DATABASE_URL` (bloqueio de `..`, bytes nulos, diretórios críticos do SO e arquivos/sidecars `.db` que sejam symlinks), `OpenFlags` explícitas sem `SQLITE_OPEN_URI`, modo WAL com `busy_timeout(5s)`, endurecimento de permissões (`0o600` em `.db`, `-wal` e `-shm`) e queries exclusivamente parametrizadas (`params!`).
 
 ## 4. Fluxo Git, Estratégia de Branches e Padrão de Commits
 

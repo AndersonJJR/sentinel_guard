@@ -13,7 +13,10 @@ use tokio::sync::{Mutex, RwLock, watch};
 
 use crate::domain::entities::RuntimeConfig;
 use crate::domain::errors::DomainError;
-use crate::domain::path_policy::{ensure_distinct_non_nested_dirs, reject_forbidden_system_dir};
+use crate::domain::path_policy::{
+    ensure_distinct_non_nested_dirs, reject_empty_and_null_bytes, reject_forbidden_system_dir,
+    sanitize_file_name, validate_absolute_non_system_file_path, validate_absolute_non_system_path,
+};
 use crate::domain::ports::ConfigStore;
 
 const MAX_SYMLINK_HOPS: usize = 40;
@@ -164,16 +167,57 @@ fn validate_operational_dir(raw_path: &Path, label: &str) -> Result<PathBuf, Dom
     Ok(canonical)
 }
 
-fn validate_auxiliary_path(raw_path: &Path, label: &str) -> Result<PathBuf, DomainError> {
-    validate_and_resolve_path(raw_path, label)
+/// Validates and canonicalizes an auxiliary configuration path without requiring the target leaf to exist yet.
+pub fn validate_auxiliary_path(raw_path: &Path, label: &str) -> Result<PathBuf, DomainError> {
+    validate_absolute_non_system_file_path(raw_path, label)?;
+
+    let canonicalized = resolve_and_canonicalize_path(raw_path, label)?;
+    sanitize_file_name(&canonicalized)?;
+
+    match std::fs::symlink_metadata(&canonicalized) {
+        Ok(meta) => {
+            if meta.file_type().is_dir() {
+                return Err(DomainError::InvalidPath(format!(
+                    "{label} must not be a directory: {}",
+                    canonicalized.display()
+                )));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                if label == "clamd_socket_path" && !meta.file_type().is_socket() {
+                    return Err(DomainError::InvalidPath(format!(
+                        "{label} must be a Unix domain socket: {}",
+                        canonicalized.display()
+                    )));
+                }
+                if label == "suricata_eve_path" && !meta.file_type().is_file() {
+                    return Err(DomainError::InvalidPath(format!(
+                        "{label} must be a regular file: {}",
+                        canonicalized.display()
+                    )));
+                }
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) if err.kind() == ErrorKind::NotADirectory => {
+            return Err(DomainError::InvalidPath(format!(
+                "{label} path traverses through a non-directory component: {}",
+                canonicalized.display()
+            )));
+        }
+        Err(err) => return Err(DomainError::IoError(err)),
+    }
+
+    Ok(canonicalized)
 }
 
 fn validate_and_resolve_path(raw_path: &Path, label: &str) -> Result<PathBuf, DomainError> {
-    reject_empty_and_null_bytes(raw_path, label)?;
-    reject_parent_traversal(raw_path)?;
-    require_absolute_path(raw_path, label)?;
-    reject_forbidden_system_dir(raw_path)?;
+    validate_absolute_non_system_path(raw_path, label)?;
+    resolve_and_canonicalize_path(raw_path, label)
+}
 
+fn resolve_and_canonicalize_path(raw_path: &Path, label: &str) -> Result<PathBuf, DomainError> {
     let resolved = resolve_symlinks_and_normalize(raw_path, label)?;
     reject_forbidden_system_dir(&resolved)?;
 
@@ -181,44 +225,6 @@ fn validate_and_resolve_path(raw_path: &Path, label: &str) -> Result<PathBuf, Do
     reject_forbidden_system_dir(&canonicalized)?;
 
     Ok(canonicalized)
-}
-
-fn reject_empty_and_null_bytes(path: &Path, label: &str) -> Result<(), DomainError> {
-    if path.as_os_str().is_empty() {
-        return Err(DomainError::InvalidPath(format!(
-            "{label} path must not be empty"
-        )));
-    }
-
-    if path.as_os_str().as_encoded_bytes().contains(&0) {
-        return Err(DomainError::PathTraversalAttempt(format!(
-            "{label} path contains null byte"
-        )));
-    }
-
-    Ok(())
-}
-
-fn reject_parent_traversal(path: &Path) -> Result<(), DomainError> {
-    for component in path.components() {
-        if matches!(component, Component::ParentDir) {
-            return Err(DomainError::PathTraversalAttempt(format!(
-                "Parent directory traversal ('..') is not allowed: {}",
-                path.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn require_absolute_path(path: &Path, label: &str) -> Result<(), DomainError> {
-    if !path.is_absolute() {
-        return Err(DomainError::InvalidPath(format!(
-            "{label} path must be absolute: {}",
-            path.display()
-        )));
-    }
-    Ok(())
 }
 
 fn normalize_lexical(path: &Path) -> PathBuf {
@@ -837,9 +843,101 @@ mod tests {
             .expect_err("empty auxiliary path must fail");
         assert!(matches!(empty_aux, DomainError::InvalidPath(_)));
 
-        // Succeeds even with dropped watch receiver and valid auxiliary paths.
+        // Rejects trailing slash, '/.', backslash filename, control chars, and existing directory as auxiliary path.
         let custom_clamd = root.path().join("clamd.ctl");
         let custom_eve = root.path().join("eve.json");
+        let aux_dir = root.path().join("aux_dir");
+        std::fs::create_dir_all(&aux_dir).expect("create aux_dir");
+        for (case_name, clamd, eve) in [
+            (
+                "trailing_slash",
+                Some(PathBuf::from(format!("{}/", custom_clamd.display()))),
+                None,
+            ),
+            ("trailing_dot", None, Some(custom_eve.join("."))),
+            (
+                "control_char_in_filename",
+                Some(root.path().join("bad\nclamd.ctl")),
+                None,
+            ),
+            ("existing_dir_as_eve", None, Some(aux_dir.clone())),
+        ] {
+            let err = use_case
+                .execute(UpdateConfigRequest {
+                    quarantine_dir: new_q.clone(),
+                    approved_dir: new_a.clone(),
+                    clamd_socket_path: clamd,
+                    suricata_eve_path: eve,
+                })
+                .await
+                .expect_err("invalid auxiliary path format or directory target must fail");
+            assert!(
+                matches!(err, DomainError::InvalidPath(_)),
+                "case '{case_name}' expected InvalidPath, got {err:?}"
+            );
+        }
+
+        let backslash_err = use_case
+            .execute(UpdateConfigRequest {
+                quarantine_dir: new_q.clone(),
+                approved_dir: new_a.clone(),
+                clamd_socket_path: Some(root.path().join("sub\\clamd.ctl")),
+                suricata_eve_path: None,
+            })
+            .await
+            .expect_err("backslash in auxiliary filename must fail");
+        assert!(matches!(
+            backslash_err,
+            DomainError::PathTraversalAttempt(_)
+        ));
+
+        let regular_as_clamd = root.path().join("not_a_socket.txt");
+        std::fs::write(&regular_as_clamd, b"not a socket").expect("create regular file");
+        let regular_clamd_err = use_case
+            .execute(UpdateConfigRequest {
+                quarantine_dir: new_q.clone(),
+                approved_dir: new_a.clone(),
+                clamd_socket_path: Some(regular_as_clamd),
+                suricata_eve_path: None,
+            })
+            .await
+            .expect_err("existing regular file as clamd_socket_path must fail");
+        assert!(matches!(regular_clamd_err, DomainError::InvalidPath(_)));
+
+        #[cfg(unix)]
+        {
+            let socket_as_eve = root.path().join("sock_as_eve.sock");
+            let _listener = std::os::unix::net::UnixListener::bind(&socket_as_eve)
+                .expect("bind unix socket for suricata rejection test");
+            let socket_eve_err = use_case
+                .execute(UpdateConfigRequest {
+                    quarantine_dir: new_q.clone(),
+                    approved_dir: new_a.clone(),
+                    clamd_socket_path: None,
+                    suricata_eve_path: Some(socket_as_eve),
+                })
+                .await
+                .expect_err("existing unix socket as suricata_eve_path must fail");
+            assert!(matches!(socket_eve_err, DomainError::InvalidPath(_)));
+
+            let clean_eve = root.path().join("clean.json");
+            std::fs::write(&clean_eve, b"{}\n").expect("create clean.json");
+            let bad_symlink = root.path().join("bad\nsymlink");
+            std::os::unix::fs::symlink(&clean_eve, &bad_symlink)
+                .expect("create symlink with control char name");
+            let bad_symlink_err = use_case
+                .execute(UpdateConfigRequest {
+                    quarantine_dir: new_q.clone(),
+                    approved_dir: new_a.clone(),
+                    clamd_socket_path: None,
+                    suricata_eve_path: Some(bad_symlink),
+                })
+                .await
+                .expect_err("symlink whose raw name contains control char must fail");
+            assert!(matches!(bad_symlink_err, DomainError::InvalidPath(_)));
+        }
+
+        // Succeeds even with dropped watch receiver and valid auxiliary paths.
         let updated = use_case
             .execute(UpdateConfigRequest {
                 quarantine_dir: new_q,

@@ -1,5 +1,6 @@
 //! Composition root and daemon entrypoint for Sentinel Guard.
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -7,17 +8,19 @@ use tokio::sync::{RwLock, mpsc, watch};
 use tracing_subscriber::EnvFilter;
 
 use sentinel_guard::application::inspect_file::InspectFileUseCase;
-use sentinel_guard::application::update_config::UpdateConfigUseCase;
+use sentinel_guard::application::update_config::{UpdateConfigUseCase, validate_auxiliary_path};
 use sentinel_guard::domain::entities::RuntimeConfig;
 use sentinel_guard::domain::errors::DomainError;
 use sentinel_guard::domain::path_policy::ensure_distinct_non_nested_dirs;
 use sentinel_guard::domain::ports::{ConfigStore, FileScanner};
+use sentinel_guard::infrastructure::clamav_client::ClamAvScanner;
 use sentinel_guard::infrastructure::config_env::BootstrapConfig;
 use sentinel_guard::infrastructure::fs_watcher::{
     FsQuarantineMover, InotifyWatcher, validate_real_directory,
 };
 use sentinel_guard::infrastructure::magic_bytes::{MagicBytesInspector, StreamingHasher};
 use sentinel_guard::infrastructure::sqlite_repo::SqliteStore;
+use sentinel_guard::infrastructure::suricata_tail::SuricataCorrelator;
 
 const WATCHER_EVENT_CHANNEL_CAPACITY: usize = 256;
 
@@ -42,7 +45,10 @@ async fn main() -> anyhow::Result<()> {
 
     let hasher = Arc::new(StreamingHasher::new());
     let magic_inspector = Arc::new(MagicBytesInspector::new());
-    let scanners: Vec<Arc<dyn FileScanner>> = vec![magic_inspector.clone()];
+    let clamav_scanner = Arc::new(ClamAvScanner::new(runtime_config.clone()));
+    let suricata_correlator = Arc::new(SuricataCorrelator::new(runtime_config.clone()));
+    let scanners: Vec<Arc<dyn FileScanner>> =
+        vec![magic_inspector.clone(), clamav_scanner, suricata_correlator];
     let quarantine_mover = Arc::new(FsQuarantineMover::new());
 
     let inspect_use_case = Arc::new(InspectFileUseCase::new(
@@ -67,6 +73,8 @@ async fn main() -> anyhow::Result<()> {
             bind_address = %bootstrap.bind_address,
             quarantine_dir = %cfg.quarantine_dir.display(),
             approved_dir = %cfg.approved_dir.display(),
+            clamd_socket_path = %cfg.clamd_socket_path.display(),
+            suricata_eve_path = %cfg.suricata_eve_path.display(),
             "Sentinel Guard daemon initialized"
         );
     }
@@ -190,16 +198,28 @@ async fn validate_startup_config_and_watcher(
     event_tx: mpsc::Sender<PathBuf>,
 ) -> Result<InotifyWatcher, DomainError> {
     let raw_approved_dir = initial_config.approved_dir.clone();
-    let canonical_approved_dir = tokio::task::spawn_blocking(move || {
-        validate_real_directory(&raw_approved_dir, "approved_dir")
-    })
-    .await
-    .map_err(|err| {
-        DomainError::ConfigError(format!(
-            "Startup approved_dir validation task failed: {err}"
-        ))
-    })??;
+    let raw_clamd_socket_path = initial_config.clamd_socket_path.clone();
+    let raw_suricata_eve_path = initial_config.suricata_eve_path.clone();
+
+    let (canonical_approved_dir, canonical_clamd_path, canonical_eve_path) =
+        tokio::task::spawn_blocking(
+            move || -> Result<(PathBuf, PathBuf, PathBuf), DomainError> {
+                let approved = validate_real_directory(&raw_approved_dir, "approved_dir")?;
+                let clamd =
+                    validate_startup_auxiliary_path(&raw_clamd_socket_path, "clamd_socket_path")?;
+                let suricata =
+                    validate_startup_auxiliary_path(&raw_suricata_eve_path, "suricata_eve_path")?;
+                Ok((approved, clamd, suricata))
+            },
+        )
+        .await
+        .map_err(|err| {
+            DomainError::ConfigError(format!("Startup path validation task failed: {err}"))
+        })??;
+
     initial_config.approved_dir = canonical_approved_dir;
+    initial_config.clamd_socket_path = canonical_clamd_path;
+    initial_config.suricata_eve_path = canonical_eve_path;
 
     let watcher = InotifyWatcher::new(initial_config.quarantine_dir.clone(), dir_rx, event_tx)?;
     initial_config.quarantine_dir = watcher.current_dir().to_path_buf();
@@ -207,6 +227,32 @@ async fn validate_startup_config_and_watcher(
     ensure_distinct_non_nested_dirs(&initial_config.quarantine_dir, &initial_config.approved_dir)?;
 
     Ok(watcher)
+}
+
+fn validate_startup_auxiliary_path(raw_path: &Path, label: &str) -> Result<PathBuf, DomainError> {
+    let canonical = validate_auxiliary_path(raw_path, label)?;
+
+    let normalized_raw: PathBuf = raw_path.components().collect();
+    match std::fs::symlink_metadata(&normalized_raw) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(DomainError::PathTraversalAttempt(format!(
+                    "{label} must not be a symlink: {}",
+                    raw_path.display()
+                )));
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) if err.kind() == ErrorKind::NotADirectory => {
+            return Err(DomainError::InvalidPath(format!(
+                "{label} path traverses through a non-directory component: {}",
+                raw_path.display()
+            )));
+        }
+        Err(err) => return Err(DomainError::IoError(err)),
+    }
+
+    Ok(canonical)
 }
 
 #[cfg(test)]
@@ -323,6 +369,188 @@ mod tests {
                 .err()
                 .expect("equal or nested dirs must fail fast");
             assert!(matches!(err, DomainError::InvalidPath(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_validation_rejects_unsafe_auxiliary_paths_and_allows_missing_valid_targets() {
+        let root = tempdir().expect("tempdir");
+        let q_dir = root.path().join("quarantine");
+        let a_dir = root.path().join("approved");
+        std::fs::create_dir_all(&q_dir).expect("create q_dir");
+        std::fs::create_dir_all(&a_dir).expect("create a_dir");
+
+        // 1. Non-existent clamd.ctl and eve.json under safe ancestors succeed at startup.
+        let mut future_cfg = sample_config(q_dir.clone(), a_dir.clone());
+        future_cfg.clamd_socket_path = root.path().join("future_run/clamd.ctl");
+        future_cfg.suricata_eve_path = root.path().join("future_logs/eve.json");
+        let (_dir_tx, dir_rx) = watch::channel(future_cfg.quarantine_dir.clone());
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let watcher = validate_startup_config_and_watcher(&mut future_cfg, dir_rx, event_tx)
+            .await
+            .expect("missing auxiliary targets under safe parents should succeed at startup");
+        drop(watcher);
+
+        // 2. Forbidden system paths fail fast.
+        for (clamd, eve) in [
+            (
+                PathBuf::from("/etc/passwd"),
+                root.path().join("safe_eve.json"),
+            ),
+            (
+                root.path().join("safe_clamd.ctl"),
+                PathBuf::from("/etc/passwd"),
+            ),
+            (
+                PathBuf::from("/etc/clamav/clamd.ctl"),
+                root.path().join("safe_eve.json"),
+            ),
+            (
+                root.path().join("safe_clamd.ctl"),
+                PathBuf::from("/proc/1/status"),
+            ),
+        ] {
+            let mut cfg = sample_config(q_dir.clone(), a_dir.clone());
+            cfg.clamd_socket_path = clamd;
+            cfg.suricata_eve_path = eve;
+            let (_dir_tx, dir_rx) = watch::channel(cfg.quarantine_dir.clone());
+            let (event_tx, _event_rx) = mpsc::channel(8);
+            let err = validate_startup_config_and_watcher(&mut cfg, dir_rx, event_tx)
+                .await
+                .err()
+                .expect("forbidden auxiliary path must fail startup");
+            assert!(matches!(err, DomainError::ForbiddenSystemDirectory(_)));
+        }
+
+        // 3. Relative, empty, and trailing-slash auxiliary paths fail with InvalidPath.
+        for (clamd, eve) in [
+            (PathBuf::from("clamd.ctl"), root.path().join("eve.json")),
+            (
+                root.path().join("clamd.ctl"),
+                PathBuf::from("relative/eve.json"),
+            ),
+            (PathBuf::new(), root.path().join("eve.json")),
+            (root.path().join("clamd.ctl"), PathBuf::new()),
+            (
+                root.path().join("clamd.ctl"),
+                PathBuf::from(format!("{}/", root.path().join("eve.json").display())),
+            ),
+        ] {
+            let mut cfg = sample_config(q_dir.clone(), a_dir.clone());
+            cfg.clamd_socket_path = clamd;
+            cfg.suricata_eve_path = eve;
+            let (_dir_tx, dir_rx) = watch::channel(cfg.quarantine_dir.clone());
+            let (event_tx, _event_rx) = mpsc::channel(8);
+            let err = validate_startup_config_and_watcher(&mut cfg, dir_rx, event_tx)
+                .await
+                .err()
+                .expect("invalid auxiliary path must fail startup");
+            assert!(matches!(err, DomainError::InvalidPath(_)));
+        }
+
+        // 4. Traversal '..' and null bytes fail with PathTraversalAttempt.
+        for (clamd, eve) in [
+            (
+                root.path().join("../clamd.ctl"),
+                root.path().join("eve.json"),
+            ),
+            (
+                root.path().join("clamd.ctl"),
+                root.path().join("../eve.json"),
+            ),
+            (
+                PathBuf::from("/tmp/clam\0.ctl"),
+                root.path().join("eve.json"),
+            ),
+            (
+                root.path().join("clamd.ctl"),
+                PathBuf::from("/tmp/eve\0.json"),
+            ),
+        ] {
+            let mut cfg = sample_config(q_dir.clone(), a_dir.clone());
+            cfg.clamd_socket_path = clamd;
+            cfg.suricata_eve_path = eve;
+            let (_dir_tx, dir_rx) = watch::channel(cfg.quarantine_dir.clone());
+            let (event_tx, _event_rx) = mpsc::channel(8);
+            let err = validate_startup_config_and_watcher(&mut cfg, dir_rx, event_tx)
+                .await
+                .err()
+                .expect("traversal auxiliary path must fail startup");
+            assert!(matches!(err, DomainError::PathTraversalAttempt(_)));
+        }
+
+        #[cfg(unix)]
+        {
+            let real_eve = root.path().join("real_eve.json");
+            std::fs::write(&real_eve, b"").expect("write real_eve");
+            let sym_eve = root.path().join("sym_eve.json");
+            std::os::unix::fs::symlink(&real_eve, &sym_eve).expect("symlink eve");
+
+            let sym_clamd = root.path().join("sym_clamd.ctl");
+            std::os::unix::fs::symlink(root.path().join("real_clamd.ctl"), &sym_clamd)
+                .expect("symlink clamd");
+
+            for (clamd, eve) in [
+                (root.path().join("clamd.ctl"), sym_eve),
+                (sym_clamd, root.path().join("eve.json")),
+            ] {
+                let mut cfg = sample_config(q_dir.clone(), a_dir.clone());
+                cfg.clamd_socket_path = clamd;
+                cfg.suricata_eve_path = eve;
+                let (_dir_tx, dir_rx) = watch::channel(cfg.quarantine_dir.clone());
+                let (event_tx, _event_rx) = mpsc::channel(8);
+                let err = validate_startup_config_and_watcher(&mut cfg, dir_rx, event_tx)
+                    .await
+                    .err()
+                    .expect("leaf symlink auxiliary path must fail startup");
+                assert!(matches!(err, DomainError::PathTraversalAttempt(_)));
+            }
+
+            let etc_link = root.path().join("etc_link");
+            std::os::unix::fs::symlink("/etc", &etc_link).expect("symlink /etc");
+            let mut etc_cfg = sample_config(q_dir.clone(), a_dir.clone());
+            etc_cfg.suricata_eve_path = etc_link.join("eve.json");
+            let (_dir_tx, dir_rx) = watch::channel(etc_cfg.quarantine_dir.clone());
+            let (event_tx, _event_rx) = mpsc::channel(8);
+            let err = validate_startup_config_and_watcher(&mut etc_cfg, dir_rx, event_tx)
+                .await
+                .err()
+                .expect("symlink ancestor to /etc must fail startup");
+            assert!(matches!(err, DomainError::ForbiddenSystemDirectory(_)));
+
+            // 5. Real socket + real regular file succeed, whereas type confusion and directories fail fast.
+            let real_socket_path = root.path().join("real_clamd.ctl");
+            let _listener =
+                std::os::unix::net::UnixListener::bind(&real_socket_path).expect("bind socket");
+            let mut live_cfg = sample_config(q_dir.clone(), a_dir.clone());
+            live_cfg.clamd_socket_path = real_socket_path.clone();
+            live_cfg.suricata_eve_path = real_eve.clone();
+            let (_dir_tx, dir_rx) = watch::channel(live_cfg.quarantine_dir.clone());
+            let (event_tx, _event_rx) = mpsc::channel(8);
+            let live_watcher = validate_startup_config_and_watcher(&mut live_cfg, dir_rx, event_tx)
+                .await
+                .expect("real unix socket and regular eve.json should pass startup validation");
+            drop(live_watcher);
+
+            let existing_dir = root.path().join("existing_dir");
+            std::fs::create_dir_all(&existing_dir).expect("mkdir existing_dir");
+            for (clamd, eve) in [
+                (real_eve.clone(), real_eve.clone()),
+                (real_socket_path.clone(), real_socket_path),
+                (existing_dir.clone(), real_eve),
+                (root.path().join("missing_clamd.ctl"), existing_dir),
+            ] {
+                let mut type_cfg = sample_config(q_dir.clone(), a_dir.clone());
+                type_cfg.clamd_socket_path = clamd;
+                type_cfg.suricata_eve_path = eve;
+                let (_dir_tx, dir_rx) = watch::channel(type_cfg.quarantine_dir.clone());
+                let (event_tx, _event_rx) = mpsc::channel(8);
+                let err = validate_startup_config_and_watcher(&mut type_cfg, dir_rx, event_tx)
+                    .await
+                    .err()
+                    .expect("wrong file type or directory for auxiliary path must fail startup");
+                assert!(matches!(err, DomainError::InvalidPath(_)));
+            }
         }
     }
 }
