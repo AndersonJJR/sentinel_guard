@@ -129,6 +129,11 @@ impl SqliteStore {
 
         Ok(Self { conn })
     }
+
+    /// Gracefully closes the underlying SQLite background connection.
+    pub async fn close(self) -> Result<(), DomainError> {
+        self.conn.close().await.map_err(map_storage_err)
+    }
 }
 
 #[async_trait]
@@ -587,7 +592,7 @@ fn sqlite_sidecar_paths(db_path: &Path) -> [PathBuf; 2] {
 fn prepare_sqlite_files_before_open(db_path: &Path) -> Result<(), DomainError> {
     ensure_db_file_mode_0600(db_path)?;
     let [wal_path, shm_path] = sqlite_sidecar_paths(db_path);
-    harden_paths_0600(&[wal_path.as_path(), shm_path.as_path()])
+    harden_sidecar_paths_0600(&[wal_path.as_path(), shm_path.as_path()])
 }
 
 #[cfg(not(unix))]
@@ -647,7 +652,7 @@ fn ensure_db_file_mode_0600(db_path: &Path) -> Result<(), DomainError> {
     const MAX_ATTEMPTS: usize = 3;
     for _attempt in 0..MAX_ATTEMPTS {
         match std::fs::symlink_metadata(db_path) {
-            Ok(meta) => return ensure_fd_mode_0600(db_path, &meta),
+            Ok(meta) => return ensure_fd_mode_0600(db_path, &meta, false),
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 let mut opts = std::fs::OpenOptions::new();
                 opts.write(true).create_new(true);
@@ -682,7 +687,11 @@ fn ensure_db_file_mode_0600(db_path: &Path) -> Result<(), DomainError> {
 }
 
 #[cfg(unix)]
-fn ensure_fd_mode_0600(path: &Path, lstat_meta: &std::fs::Metadata) -> Result<(), DomainError> {
+fn ensure_fd_mode_0600(
+    path: &Path,
+    lstat_meta: &std::fs::Metadata,
+    allow_vanished_on_open: bool,
+) -> Result<(), DomainError> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
     if lstat_meta.file_type().is_symlink() {
@@ -706,9 +715,17 @@ fn ensure_fd_mode_0600(path: &Path, lstat_meta: &std::fs::Metadata) -> Result<()
     opts.read(true);
     opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
 
-    let file = opts
-        .open(path)
-        .map_err(|err| map_open_nofollow_err(path, err))?;
+    let file = match opts.open(path) {
+        Ok(file) => file,
+        Err(err)
+            if allow_vanished_on_open
+                && err.kind() == ErrorKind::NotFound
+                && err.raw_os_error() != Some(libc::ELOOP) =>
+        {
+            return Ok(());
+        }
+        Err(err) => return Err(map_open_nofollow_err(path, err)),
+    };
     let fd_meta = file.metadata().map_err(map_storage_err)?;
 
     if !fd_meta.file_type().is_file() {
@@ -746,10 +763,18 @@ fn map_open_nofollow_err(path: &Path, err: std::io::Error) -> DomainError {
 }
 
 #[cfg(unix)]
-fn harden_paths_0600(paths: &[&Path]) -> Result<(), DomainError> {
+fn harden_mandatory_db_path_0600(db_path: &Path) -> Result<(), DomainError> {
+    match std::fs::symlink_metadata(db_path) {
+        Ok(meta) => ensure_fd_mode_0600(db_path, &meta, false),
+        Err(err) => Err(map_storage_err(err)),
+    }
+}
+
+#[cfg(unix)]
+fn harden_sidecar_paths_0600(paths: &[&Path]) -> Result<(), DomainError> {
     for path in paths {
         match std::fs::symlink_metadata(path) {
-            Ok(meta) => ensure_fd_mode_0600(path, &meta)?,
+            Ok(meta) => ensure_fd_mode_0600(path, &meta, true)?,
             Err(err) if err.kind() == ErrorKind::NotFound => {}
             Err(err) => return Err(map_storage_err(err)),
         }
@@ -760,8 +785,9 @@ fn harden_paths_0600(paths: &[&Path]) -> Result<(), DomainError> {
 
 #[cfg(unix)]
 fn harden_sqlite_file_permissions(db_path: &Path) -> Result<(), DomainError> {
+    harden_mandatory_db_path_0600(db_path)?;
     let [wal_path, shm_path] = sqlite_sidecar_paths(db_path);
-    harden_paths_0600(&[db_path, wal_path.as_path(), shm_path.as_path()])
+    harden_sidecar_paths_0600(&[wal_path.as_path(), shm_path.as_path()])
 }
 
 #[cfg(not(unix))]
@@ -2040,7 +2066,7 @@ mod tests {
             .expect("invoke mkfifo for wal");
         assert!(mkfifo_wal_status.success(), "mkfifo wal must succeed");
         assert!(matches!(
-            harden_sqlite_file_permissions(&db_with_fifo_wal),
+            harden_sidecar_paths_0600(&[fifo_wal.as_path()]),
             Err(DomainError::StorageError(_))
         ));
         let fifo_wal_err =
@@ -2061,6 +2087,73 @@ mod tests {
             map_open_nofollow_err(&symlink_db, std::io::Error::from_raw_os_error(libc::ELOOP)),
             DomainError::PathTraversalAttempt(_)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn optional_sidecar_hardening_tolerates_vanished_wal_shm_while_keeping_db_mandatory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // 1. Missing mandatory db_path must fail harden_sqlite_file_permissions.
+        let missing_db = dir.path().join("missing_mandatory.db");
+        assert!(matches!(
+            harden_sqlite_file_permissions(&missing_db),
+            Err(DomainError::StorageError(_))
+        ));
+
+        // 2. Nonexistent optional -wal / -shm sidecars return Ok(()).
+        let [nonexistent_wal, nonexistent_shm] = sqlite_sidecar_paths(&missing_db);
+        harden_sidecar_paths_0600(&[nonexistent_wal.as_path(), nonexistent_shm.as_path()])
+            .expect("nonexistent optional sidecars should be tolerated");
+
+        // 3. Simulated unlink race between symlink_metadata and open():
+        //    optional sidecar (allow_vanished_on_open = true) returns Ok(()),
+        //    while mandatory db_path (allow_vanished_on_open = false) returns StorageError.
+        let vanished_sidecar = dir.path().join("vanished.db-wal");
+        std::fs::write(&vanished_sidecar, b"wal").expect("write sidecar");
+        std::fs::set_permissions(&vanished_sidecar, std::fs::Permissions::from_mode(0o644))
+            .expect("set permissive 0o644");
+        let lstat_meta =
+            std::fs::symlink_metadata(&vanished_sidecar).expect("capture lstat before unlink");
+        std::fs::remove_file(&vanished_sidecar).expect("simulate concurrent unlink");
+
+        ensure_fd_mode_0600(&vanished_sidecar, &lstat_meta, true)
+            .expect("vanished optional sidecar on open must return Ok(())");
+        assert!(matches!(
+            ensure_fd_mode_0600(&vanished_sidecar, &lstat_meta, false),
+            Err(DomainError::StorageError(_))
+        ));
+
+        // 4. Sidecar symlinks and FIFOs remain strictly fatal.
+        let decoy = dir.path().join("decoy.bin");
+        std::fs::write(&decoy, b"decoy").expect("write decoy");
+        let symlink_wal = dir.path().join("sym.db-wal");
+        symlink(&decoy, &symlink_wal).expect("create symlink sidecar");
+        assert!(matches!(
+            harden_sidecar_paths_0600(&[symlink_wal.as_path()]),
+            Err(DomainError::PathTraversalAttempt(_))
+        ));
+
+        let fifo_shm = dir.path().join("pipe.db-shm");
+        let mkfifo_status = Command::new("mkfifo")
+            .arg(&fifo_shm)
+            .status()
+            .expect("invoke mkfifo");
+        assert!(mkfifo_status.success(), "mkfifo must succeed");
+        assert!(matches!(
+            harden_sidecar_paths_0600(&[fifo_shm.as_path()]),
+            Err(DomainError::StorageError(_))
+        ));
+
+        // 5. Explicit SqliteStore::close() closes cleanly on in-memory & file-backed stores.
+        let file_db = dir.path().join("explicit_close.db");
+        let store = SqliteStore::connect_and_migrate(&format!("sqlite://{}", file_db.display()))
+            .await
+            .expect("connect file db");
+        store.close().await.expect("explicit close must succeed");
     }
 
     #[tokio::test]
